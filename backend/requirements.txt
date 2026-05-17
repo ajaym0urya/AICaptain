@@ -1,7 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
 httpx
 beautifulsoup4
-groq
+google-genai
 python-dotenv
 pydantic

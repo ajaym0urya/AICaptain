@@ -1,21 +1,23 @@
 import os
 import time
+import json
+import asyncio
 from typing import Dict, Tuple
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from groq import Groq
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
+from agents import run_captain_pipeline
 
 load_dotenv()
 
-app = FastAPI(title="AI CricTracker Backend")
+app = FastAPI(title="AI CricTracker — Captain Cool Backend")
 
-# Allow requests from Next.js frontend (useful for local dev)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,169 +26,186 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Groq Client
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-client = Groq(api_key=GROQ_API_KEY)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+MODEL = "gemini-2.5-flash"
+
+def get_client() -> genai.Client:
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set.")
+    return genai.Client(api_key=GEMINI_API_KEY)
 
 class URLRequest(BaseModel):
     url: str
 
+class CaptainRequest(BaseModel):
+    url: str  # Cricbuzz match URL
+
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 }
 
-# --- SIMPLE MEMORY CACHE ---
-# Structure: { "url": (timestamp, data_dict) }
-CACHE_TTL = 10 # seconds
+# ── Memory Cache (10s TTL for live endpoint) ──────────────────────────────────
+CACHE_TTL = 10
 live_cache: Dict[str, Tuple[float, dict]] = {}
 
-async def fetch_html(url: str) -> str:
-    async with httpx.AsyncClient() as http_client:
+
+# ── Internal Scraper (used by agents as tool + by HTTP endpoints) ─────────────
+async def _fetch_html(url: str) -> str:
+    async with httpx.AsyncClient() as client:
         try:
-            response = await http_client.get(url, headers=HEADERS, timeout=15.0)
-            response.raise_for_status()
-            return response.text
+            r = await client.get(url, headers=HEADERS, timeout=15.0)
+            r.raise_for_status()
+            return r.text
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e}")
 
-def ask_groq(prompt: str, data: str, json_schema: str) -> str:
-    if not GROQ_API_KEY:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not set.")
+
+async def _extract_static(html: str) -> dict:
+    """Extract static match info using Gemini."""
+    soup = BeautifulSoup(html, 'html.parser')
+    h1 = soup.find('h1')
+    info = soup.find(class_='cb-match-info')
+    text = (h1.get_text(' ', strip=True) if h1 else "") + " " + \
+           (info.get_text(' ', strip=True) if info else soup.text[:2000])
+
+    client = get_client()
+    prompt = f"""
+    Extract static match information from this text.
+    Return ONLY valid JSON matching this schema:
+    {{"matchTitle":"","venue":"","toss":"","format":""}}
     
-    full_prompt = f"""
-    {prompt}
-    
-    Return ONLY a valid JSON object matching this schema. No markdown, no intro.
-    {json_schema}
-    
-    Data:
-    {data}
+    Text: {text[:3000]}
     """
-    
-    response = client.chat.completions.create(
-        messages=[{"role": "user", "content": full_prompt}],
-        model="llama-3.1-8b-instant",
-        temperature=0.1,
-        response_format={"type": "json_object"}
+    r = await asyncio.to_thread(
+        client.models.generate_content,
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.1)
     )
-    return response.choices[0].message.content
+    raw = r.text.strip().strip("```json").strip("```").strip()
+    return json.loads(raw)
 
+
+async def _extract_live(html: str) -> dict:
+    """Extract live score data using Gemini."""
+    soup = BeautifulSoup(html, 'html.parser')
+    container = soup.find(class_='cb-col-100 cb-col')
+    commentary = soup.find(class_='cb-com-ln')
+
+    text = ""
+    if container:
+        text += container.get_text(' ', strip=True)
+    if commentary:
+        text += " " + commentary.parent.get_text(' ', strip=True)
+    if not text:
+        text = soup.body.get_text(' ', strip=True)[:5000]
+    text = text[:5000]
+
+    client = get_client()
+    schema = json.dumps({
+        "matchStatus": "",
+        "score": "",
+        "runRate": "",
+        "batsmen": [{"name": "", "runs": "", "balls": ""}],
+        "bowlers": [{"name": "", "overs": "", "runs": "", "wickets": ""}],
+        "recentBalls": [""]
+    })
+    prompt = f"""
+    Extract live cricket match data from the text below.
+    Return ONLY valid JSON matching this schema (no markdown):
+    {schema}
+    
+    Text: {text}
+    """
+    r = await asyncio.to_thread(
+        client.models.generate_content,
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.1)
+    )
+    raw = r.text.strip().strip("```json").strip("```").strip()
+    return json.loads(raw)
+
+
+# ── API Endpoints ─────────────────────────────────────────────────────────────
 
 @app.post("/api/scrape/static")
 async def scrape_static(req: URLRequest):
-    html = await fetch_html(req.url)
-    soup = BeautifulSoup(html, 'html.parser')
-    
-    match_header = soup.find('h1')
-    match_info_div = soup.find(class_='cb-match-info')
-    
-    text_data = (match_header.get_text(separator=' ', strip=True) if match_header else "") + " " + \
-                (match_info_div.get_text(separator=' ', strip=True) if match_info_div else soup.text[:2000])
-
-    prompt = "Extract static match information like venue, series, and toss details."
-    schema = """
-    {
-      "matchTitle": "e.g., India vs Australia, 1st Test",
-      "venue": "e.g., WACA Ground, Perth",
-      "toss": "e.g., India won the toss and opt to bat",
-      "format": "e.g., Test, ODI, or T20"
-    }
-    """
-    
-    import json
-    result = ask_groq(prompt, text_data, schema)
-    return json.loads(result)
+    html = await _fetch_html(req.url)
+    return await _extract_static(html)
 
 
 @app.post("/api/scrape/live")
 async def scrape_live(req: URLRequest):
-    # Check cache first
+    # Cache check
     now = time.time()
     if req.url in live_cache:
-        cached_time, cached_data = live_cache[req.url]
-        if now - cached_time < CACHE_TTL:
-            return cached_data
+        ts, data = live_cache[req.url]
+        if now - ts < CACHE_TTL:
+            return data
 
-    # Not in cache or expired, fetch new data
-    html = await fetch_html(req.url)
-    soup = BeautifulSoup(html, 'html.parser')
-    
-    live_container = soup.find(class_='cb-col-100 cb-col') 
-    commentary = soup.find(class_='cb-com-ln')
-    
-    raw_text = ""
-    if live_container:
-        raw_text += live_container.get_text(separator=' ', strip=True)
-    if commentary:
-        raw_text += " " + commentary.parent.get_text(separator=' ', strip=True)
-        
-    if not raw_text:
-        raw_text = soup.body.get_text(separator=' ', strip=True)[:5000]
-    
-    raw_text = raw_text[:5000]
-
-    prompt = "Extract the current live score, run rate, batsmen, bowlers, and recent balls."
-    schema = """
-    {
-      "matchStatus": "e.g., India won by 10 wickets / Day 2: Stumps",
-      "score": "e.g., IND 250/3 (45.2 Ovs)",
-      "runRate": "e.g., CRR: 5.52 RRR: 7.10",
-      "batsmen": [
-        { "name": "Player 1", "runs": "45", "balls": "30" }
-      ],
-      "bowlers": [
-        { "name": "Bowler 1", "overs": "4.2", "runs": "20", "wickets": "1" }
-      ],
-      "recentBalls": [
-        "45.2: Bowler to Batsman, FOUR",
-        "45.1: Bowler to Batsman, no run"
-      ]
-    }
-    """
-    
-    import json
-    try:
-        result = ask_groq(prompt, raw_text, schema)
-        parsed_result = json.loads(result)
-        
-        # Save to cache
-        live_cache[req.url] = (now, parsed_result)
-        return parsed_result
-    except Exception as e:
-        return {"error": str(e), "data": raw_text[:200]}
+    html = await _fetch_html(req.url)
+    result = await _extract_live(html)
+    live_cache[req.url] = (now, result)
+    return result
 
 
 @app.post("/api/scrape/history")
 async def scrape_history(req: URLRequest):
-    """Dedicated endpoint for AI Agents to fetch deep historical data"""
-    html = await fetch_html(req.url)
+    """For AI agents: deep historical commentary analysis."""
+    html = await _fetch_html(req.url)
     soup = BeautifulSoup(html, 'html.parser')
-    
-    # Grab the entire commentary section (much larger than live)
-    commentary_container = soup.find(id='matchCenter') or soup.body
-    raw_text = commentary_container.get_text(separator=' | ', strip=True)
-    
-    # Allow a larger context window for the agent history (e.g. 15,000 chars)
-    raw_text = raw_text[:15000]
+    container = soup.find(id='matchCenter') or soup.body
+    text = container.get_text(' | ', strip=True)[:15000]
 
-    prompt = "Analyze the historical commentary provided. Summarize the key events, major partnerships, wickets, and the overall momentum shift of the match based on these past overs."
-    schema = """
-    {
-      "matchSummary": "A 3-4 sentence detailed summary of the match so far.",
-      "keyEvents": ["Event 1 e.g. Kohli hits 3 fours in an over", "Event 2 e.g. Bumrah takes back to back wickets"],
-      "turningPoint": "What was the biggest turning point so far?"
-    }
+    client = get_client()
+    schema = json.dumps({
+        "matchSummary": "",
+        "keyEvents": [""],
+        "turningPoint": ""
+    })
+    prompt = f"""
+    Analyze this historical cricket commentary and extract key insights.
+    Return ONLY valid JSON matching this schema:
+    {schema}
+    
+    Data: {text}
     """
-    
-    import json
-    result = ask_groq(prompt, raw_text, schema)
-    return json.loads(result)
+    r = await asyncio.to_thread(
+        client.models.generate_content,
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.3)
+    )
+    raw = r.text.strip().strip("```json").strip("```").strip()
+    return json.loads(raw)
 
 
-# --- SERVE STATIC FRONTEND (For Docker / Production) ---
+@app.post("/api/captain")
+async def get_captain_decision(req: CaptainRequest):
+    """
+    Main agentic endpoint. Runs the 4-agent Captain Cool pipeline:
+    StatsAnalyst (with live tool call) → Strategist → Devil's Advocate → Commentator
+    """
+    # Pre-fetch live data from our scraper (this IS the real tool call)
+    now = time.time()
+    if req.url in live_cache and now - live_cache[req.url][0] < CACHE_TTL:
+        live_data = live_cache[req.url][1]
+    else:
+        html = await _fetch_html(req.url)
+        live_data = await _extract_live(html)
+        live_cache[req.url] = (now, live_data)
+
+    # Run the full multi-agent pipeline
+    result = await run_captain_pipeline(url=req.url, raw_live_data=live_data)
+    return result
+
+
+# ── Serve Static Frontend (Production Docker) ─────────────────────────────────
 frontend_path = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(frontend_path):
     app.mount("/", StaticFiles(directory=frontend_path, html=True), name="static")
+
 
 if __name__ == "__main__":
     import uvicorn

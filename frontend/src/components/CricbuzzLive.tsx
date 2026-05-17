@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Activity, RefreshCcw, Search, Trophy, User, Crosshair, MapPin } from 'lucide-react';
+import CaptainCorner from './CaptainCorner';
 
 interface StaticData {
   matchTitle: string;
@@ -243,6 +244,11 @@ export default function CricbuzzLive() {
                 </AnimatePresence>
               </div>
             </motion.div>
+          )}
+
+          {/* ─── Captain Cool AI Agent Debate ─── */}
+          {activeUrl && (
+            <CaptainCorner matchUrl={activeUrl} />
           )}
 
         </div>
