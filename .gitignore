@@ -34,3 +34,4 @@ frontend/out/
 *.njsproj
 *.sln
 *.sw?
+".env" 
