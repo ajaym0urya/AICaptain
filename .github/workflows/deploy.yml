@@ -1,47 +1,64 @@
 name: Deploy to Google Cloud Run
-
+ 
 on:
   push:
     branches:
       - main
 
-env:
-  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  REGION: us-central1
-  REPO_NAME: cloud-run-source-repo
-  SERVICE_NAME: cricket-agent
-  IMAGE_URL: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-source-repo/cricket-agent:${{ github.sha }}
-
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Authenticate to Google Cloud
+        id: auth
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Create Artifact Registry Repository (if it doesn't exist)
+        run: |
+          gcloud artifacts repositories describe cloud-run-source-repo \
+            --location=us-central1 \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+          || gcloud artifacts repositories create cloud-run-source-repo \
+            --repository-format=docker \
+            --location=us-central1 \
+            --project=${{ secrets.GCP_PROJECT_ID }}
 
       - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker us-central1-docker.pkg.dev
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 
       - name: Build Docker Image
-        run: docker build -t ${{ env.IMAGE_URL }} .
+        run: |
+          docker build -t us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-source-repo/cricket-agent:${{ github.sha }} .
 
       - name: Push Docker Image to Artifact Registry
-        run: docker push ${{ env.IMAGE_URL }}
+        run: |
+          docker push us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-source-repo/cricket-agent:${{ github.sha }}
 
       - name: Deploy to Cloud Run
         run: |
-          gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image ${{ env.IMAGE_URL }} \
-            --region ${{ env.REGION }} \
+          gcloud run deploy cricket-agent \
+            --image us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-source-repo/cricket-agent:${{ github.sha }} \
+            --region us-central1 \
+            --platform managed \
             --allow-unauthenticated \
             --port 8080 \
-            --set-env-vars GROQ_API_KEY="${{ secrets.GROQ_API_KEY }}" \
-            --set-env-vars GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}"
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --set-env-vars "GROQ_API_KEY=${{ secrets.GROQ_API_KEY }},GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
+
+      - name: Get Service URL
+        run: |
+          gcloud run services describe cricket-agent \
+            --region us-central1 \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --format 'value(status.url)'
